@@ -632,7 +632,13 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
     server_instance: WorkloadMetricsServer = None
 
+    def _ensure_server_instance(self) -> None:
+        if self.server_instance is None or MetricsHandler.server_instance is None:
+            MetricsHandler.server_instance = WorkloadMetricsServer()
+            self.server_instance = MetricsHandler.server_instance
+
     def do_GET(self) -> None:
+        self._ensure_server_instance()
         parsed_url = urllib.parse.urlparse(self.path)
         path = parsed_url.path
         query = urllib.parse.parse_qs(parsed_url.query)
@@ -693,7 +699,10 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
         # 6. File Downloads (CSV, Parquet, Image)
         elif path in ("/api/download/csv", "/sample_data/simulated_workload_telemetry.csv"):
-            csv_path = Path("sample_data/simulated_workload_telemetry.csv")
+            csv_path = Path("/tmp/sample_data/simulated_workload_telemetry.csv")
+            if not csv_path.exists():
+                csv_path = Path("sample_data/simulated_workload_telemetry.csv")
+
             if csv_path.exists():
                 data = csv_path.read_bytes()
                 self.send_response(200)
@@ -706,7 +715,10 @@ class MetricsHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "CSV file not found. Please run a simulation first.")
 
         elif path in ("/api/download/parquet", "/sample_data/simulated_workload_telemetry.parquet"):
-            pq_path = Path("sample_data/simulated_workload_telemetry.parquet")
+            pq_path = Path("/tmp/sample_data/simulated_workload_telemetry.parquet")
+            if not pq_path.exists():
+                pq_path = Path("sample_data/simulated_workload_telemetry.parquet")
+
             if pq_path.exists():
                 data = pq_path.read_bytes()
                 self.send_response(200)
@@ -719,7 +731,10 @@ class MetricsHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "Parquet file not found. Please run a simulation first.")
 
         elif path in ("/api/image/timeline", "/sample_data/workload_timeline.png"):
-            img_path = Path("sample_data/workload_timeline.png")
+            img_path = Path("/tmp/sample_data/workload_timeline.png")
+            if not img_path.exists():
+                img_path = Path("sample_data/workload_timeline.png")
+
             if img_path.exists():
                 data = img_path.read_bytes()
                 self.send_response(200)
@@ -792,15 +807,16 @@ class WorkloadMetricsServer:
         for r in records[-15:]:
             self.manager.update_from_record(r)
 
-        # Export to files
-        out_dir = Path("sample_data")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        export_dataset_to_csv(telemetry_df, out_dir / "simulated_workload_telemetry.csv")
-        export_dataset_to_parquet(telemetry_df, out_dir / "simulated_workload_telemetry.parquet")
-
-        # Generate plot image
-        vis = WorkloadVisualizer(config=self.config)
-        vis.plot_timeline(telemetry_df, out_dir / "workload_timeline.png")
+        # Export to files safely (serverless read-only filesystem handling)
+        out_dir = Path("/tmp/sample_data") if os.environ.get("VERCEL") else Path("sample_data")
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            export_dataset_to_csv(telemetry_df, out_dir / "simulated_workload_telemetry.csv")
+            export_dataset_to_parquet(telemetry_df, out_dir / "simulated_workload_telemetry.parquet")
+            vis = WorkloadVisualizer(config=self.config)
+            vis.plot_timeline(telemetry_df, out_dir / "workload_timeline.png")
+        except Exception:
+            pass  # Fall back to in-memory cache if local disk is read-only
 
         self.cached_records = telemetry_df.to_dict(orient="records")
         return {"pattern": pattern, "records": self.cached_records}
