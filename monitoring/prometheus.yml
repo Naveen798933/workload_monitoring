@@ -1,0 +1,26 @@
+# ==============================================================================
+# Prometheus Scrape Configuration for Member 1 - Workload Simulation
+# ==============================================================================
+
+global:
+  scrape_interval: 2s      # Polling frequency for low-latency simulation feedback
+  evaluation_interval: 2s  # Rule evaluation frequency
+  scrape_timeout: 2s       # Timeout per scrape
+
+scrape_configs:
+  - job_name: "workload-simulator"
+    metrics_path: "/metrics"
+    scheme: "http"
+    static_configs:
+      - targets: ["localhost:8000"]
+        labels:
+          environment: "simulation"
+          service: "workload-monitoring-engine"
+          member: "member-1"
+          cluster: "synthetic-elastic-pool"
+
+    # Dynamic relabeling configurations if running inside containerized/K8s orchestrators
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: "workload_.*"
+        action: keep

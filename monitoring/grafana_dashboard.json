@@ -1,0 +1,225 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "Throughput vs Cluster Capacity (RPS)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "workload_request_rate_current",
+          "legendFormat": "Incoming Request Rate",
+          "refId": "A"
+        },
+        {
+          "expr": "workload_current_capacity_rps",
+          "legendFormat": "Aggregate Capacity",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(workload_requests_total{status=\"200\"}[30s])",
+          "legendFormat": "Served Rate (200 OK)",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "unit": "reqps"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Incoming Request Rate" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#2563EB", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Aggregate Capacity" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "#10B981", "mode": "fixed" } },
+              { "id": "custom.lineStyle", "value": { "dash": [5, 5], "fill": "dash" } }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "title": "End-to-End Latency Distribution (ms)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(workload_request_duration_seconds_bucket[1m])) by (le)) * 1000",
+          "legendFormat": "p50 Median Latency",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(workload_request_duration_seconds_bucket[1m])) by (le)) * 1000",
+          "legendFormat": "p95 Tail Latency",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(workload_request_duration_seconds_bucket[1m])) by (le)) * 1000",
+          "legendFormat": "p99 Worst Case Latency",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15
+          },
+          "unit": "ms"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "p50 Median Latency" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#F59E0B", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "p95 Tail Latency" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#F97316", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "p99 Worst Case Latency" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#EF4444", "mode": "fixed" } }]
+          }
+        ]
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 3,
+      "title": "Cluster Resource Utilization (%)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "workload_cpu_utilization_ratio * 100",
+          "legendFormat": "CPU Utilization (%)",
+          "refId": "A"
+        },
+        {
+          "expr": "(workload_memory_used_bytes / workload_memory_total_bytes) * 100",
+          "legendFormat": "Memory Utilization (%)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 100,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2
+          },
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 70 },
+              { "color": "red", "value": 85 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 4,
+      "title": "Queue Backpressure & Dropped Requests",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "workload_queue_depth",
+          "legendFormat": "Backlog Queue Depth",
+          "refId": "A"
+        },
+        {
+          "expr": "workload_queue_max_capacity",
+          "legendFormat": "Queue Max Capacity Limit",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(workload_dropped_requests_total[30s])",
+          "legendFormat": "Dropped Requests Rate (/s)",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Backlog Queue Depth" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#EC4899", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Queue Max Capacity Limit" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "#DC2626", "mode": "fixed" } },
+              { "id": "custom.lineStyle", "value": { "dash": [4, 4], "fill": "dash" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Dropped Requests Rate (/s)" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#991B1B", "mode": "fixed" } }]
+          }
+        ]
+      }
+    }
+  ],
+  "refresh": "2s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["workload", "simulation", "distributed-systems", "member-1"],
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": ["1s", "2s", "5s", "10s"]
+  },
+  "timezone": "browser",
+  "title": "Member 1 - Workload & Systems Telemetry",
+  "uid": "member1-workload-telemetry",
+  "version": 1
+}
