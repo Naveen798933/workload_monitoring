@@ -6,4 +6,4 @@ readme = "README.md"
 requires-python = ">=3.9"
 
 [tool.vercel]
-entrypoint = "index.py"
+entrypoint = "api/index.py"
