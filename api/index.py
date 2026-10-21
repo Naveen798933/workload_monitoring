@@ -9,15 +9,10 @@ root_dir = Path(__file__).resolve().parent.parent
 if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 
-from monitoring.exporter_server import MetricsHandler, WorkloadMetricsServer
+from monitoring.exporter_server import wsgi_app, MetricsHandler
 
-_server = WorkloadMetricsServer()
-MetricsHandler.server_instance = _server
+# Universal WSGI application entrypoint for Vercel
+app = wsgi_app
 
-
-class handler(MetricsHandler):
-    """Vercel native Python Serverless Function HTTP Handler."""
-    pass
-
-
-app = handler
+# BaseHTTPRequestHandler class for Vercel
+handler = MetricsHandler

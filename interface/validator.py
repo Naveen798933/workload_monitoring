@@ -77,7 +77,7 @@ def unflatten_row_to_telemetry_record(row: Dict[str, Any]) -> TelemetryRecord:
         served_rate_rps=float(row["served_rate_rps"]),
         dropped_rate_rps=float(row["dropped_rate_rps"]),
         error_count=int(row["error_count"]),
-        error_rate=float(row["error_rate"]),
+        error_rate=min(1.0, max(0.0, float(row["error_rate"]))),
         latency=LatencyDistributionRecord(
             min_ms=float(row["latency_min_ms"]),
             mean_ms=float(row["latency_mean_ms"]),
@@ -88,10 +88,10 @@ def unflatten_row_to_telemetry_record(row: Dict[str, Any]) -> TelemetryRecord:
             max_ms=float(row["latency_max_ms"]),
         ),
         resources=ResourceUtilizationRecord(
-            cpu_utilization_ratio=float(row["cpu_utilization_ratio"]),
+            cpu_utilization_ratio=min(1.0, max(0.0, float(row["cpu_utilization_ratio"]))),
             memory_used_mb=float(row["memory_used_mb"]),
             memory_total_mb=float(row["memory_total_mb"]),
-            memory_utilization_ratio=float(row["memory_utilization_ratio"]),
+            memory_utilization_ratio=min(1.0, max(0.0, float(row["memory_utilization_ratio"]))),
             allocated_cpu_cores=float(row["allocated_cpu_cores"]),
         ),
         queue=QueueTelemetryRecord(
@@ -146,12 +146,15 @@ def export_dataset_to_csv(df: pd.DataFrame, filepath: Union[str, Path]) -> str:
     return str(path.resolve())
 
 
-def export_dataset_to_parquet(df: pd.DataFrame, filepath: Union[str, Path]) -> str:
+def export_dataset_to_parquet(df: pd.DataFrame, filepath: Union[str, Path]) -> Optional[str]:
     """Exports validated telemetry DataFrame to Parquet."""
-    path = Path(filepath)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(path, index=False, engine="pyarrow")
-    return str(path.resolve())
+    try:
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(path, index=False)
+        return str(path.resolve())
+    except Exception:
+        return None
 
 
 def load_and_validate_csv(filepath: Union[str, Path]) -> List[TelemetryRecord]:

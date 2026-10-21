@@ -627,61 +627,52 @@ HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 """
 
 
-class MetricsHandler(BaseHTTPRequestHandler):
-    """HTTP Request Handler serving Web Dashboard, REST APIs, and Prometheus metrics."""
+_SHARED_SERVER: Optional[WorkloadMetricsServer] = None
 
-    server_instance: WorkloadMetricsServer = None
 
-    def _ensure_server_instance(self) -> None:
-        if self.server_instance is None or MetricsHandler.server_instance is None:
-            MetricsHandler.server_instance = WorkloadMetricsServer()
-            self.server_instance = MetricsHandler.server_instance
+def get_shared_server() -> WorkloadMetricsServer:
+    """Singleton getter for WorkloadMetricsServer."""
+    global _SHARED_SERVER
+    if _SHARED_SERVER is None:
+        _SHARED_SERVER = WorkloadMetricsServer()
+    return _SHARED_SERVER
 
-    def do_GET(self) -> None:
-        try:
-            self._do_get_impl()
-        except Exception as e:
-            import traceback
-            err_msg = f"Internal Server Error: {str(e)}\n\n{traceback.format_exc()}"
-            self.send_response(500)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(err_msg.encode("utf-8"))))
-            self.end_headers()
-            self.wfile.write(err_msg.encode("utf-8"))
 
-    def _do_get_impl(self) -> None:
-        self._ensure_server_instance()
-        parsed_url = urllib.parse.urlparse(self.path)
-        path = parsed_url.path
-        query = urllib.parse.parse_qs(parsed_url.query)
+def wsgi_app(environ: Dict[str, Any], start_response: Any) -> List[bytes]:
+    """Universal WSGI application entrypoint for Vercel, Gunicorn, and serverless."""
+    server = get_shared_server()
+    path = environ.get("PATH_INFO", "/") or "/"
+    query_string = environ.get("QUERY_STRING", "")
+    query = urllib.parse.parse_qs(query_string)
 
+    try:
         # 1. Prometheus Scrape Endpoint
         if path in ("/metrics", "/metrics/"):
-            content = self.server_instance.manager.scrape_latest()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-            self.send_header("Content-Length", str(len(content)))
-            self.end_headers()
-            self.wfile.write(content)
+            content = server.manager.scrape_latest()
+            start_response("200 OK", [
+                ("Content-Type", "text/plain; version=0.0.4; charset=utf-8"),
+                ("Content-Length", str(len(content))),
+            ])
+            return [content]
 
         # 2. Web UI Dashboard Root
         elif path in ("/", "/dashboard"):
             html_bytes = HTML_DASHBOARD_TEMPLATE.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(html_bytes)))
-            self.end_headers()
-            self.wfile.write(html_bytes)
+            start_response("200 OK", [
+                ("Content-Type", "text/html; charset=utf-8"),
+                ("Content-Length", str(len(html_bytes))),
+            ])
+            return [html_bytes]
 
         # 3. Telemetry JSON API
         elif path == "/api/telemetry":
-            payload = self.server_instance.get_current_telemetry_payload()
+            payload = server.get_current_telemetry_payload()
             json_bytes = json.dumps(payload).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(json_bytes)))
-            self.end_headers()
-            self.wfile.write(json_bytes)
+            start_response("200 OK", [
+                ("Content-Type", "application/json"),
+                ("Content-Length", str(len(json_bytes))),
+            ])
+            return [json_bytes]
 
         # 4. Trigger Simulation Run API
         elif path == "/api/simulate":
@@ -689,25 +680,25 @@ class MetricsHandler(BaseHTTPRequestHandler):
             duration = float(query.get("duration", [120])[0])
             seed = int(query.get("seed", [42])[0])
 
-            payload = self.server_instance.run_and_cache_simulation(
+            payload = server.run_and_cache_simulation(
                 pattern=pattern, duration=duration, seed=seed
             )
             json_bytes = json.dumps(payload).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(json_bytes)))
-            self.end_headers()
-            self.wfile.write(json_bytes)
+            start_response("200 OK", [
+                ("Content-Type", "application/json"),
+                ("Content-Length", str(len(json_bytes))),
+            ])
+            return [json_bytes]
 
         # 5. Live Tick API
         elif path == "/api/live-tick":
-            payload = self.server_instance.advance_live_tick()
+            payload = server.advance_live_tick()
             json_bytes = json.dumps(payload).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(json_bytes)))
-            self.end_headers()
-            self.wfile.write(json_bytes)
+            start_response("200 OK", [
+                ("Content-Type", "application/json"),
+                ("Content-Length", str(len(json_bytes))),
+            ])
+            return [json_bytes]
 
         # 6. File Downloads (CSV, Parquet, Image)
         elif path in ("/api/download/csv", "/sample_data/simulated_workload_telemetry.csv"):
@@ -717,14 +708,19 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
             if csv_path.exists():
                 data = csv_path.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/csv")
-                self.send_header("Content-Disposition", 'attachment; filename="simulated_workload_telemetry.csv"')
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                start_response("200 OK", [
+                    ("Content-Type", "text/csv"),
+                    ("Content-Disposition", 'attachment; filename="simulated_workload_telemetry.csv"'),
+                    ("Content-Length", str(len(data))),
+                ])
+                return [data]
             else:
-                self.send_error(404, "CSV file not found. Please run a simulation first.")
+                resp = b"CSV file not found. Please run a simulation first.\n"
+                start_response("404 Not Found", [
+                    ("Content-Type", "text/plain"),
+                    ("Content-Length", str(len(resp))),
+                ])
+                return [resp]
 
         elif path in ("/api/download/parquet", "/sample_data/simulated_workload_telemetry.parquet"):
             pq_path = Path("/tmp/sample_data/simulated_workload_telemetry.parquet")
@@ -733,14 +729,19 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
             if pq_path.exists():
                 data = pq_path.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Disposition", 'attachment; filename="simulated_workload_telemetry.parquet"')
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                start_response("200 OK", [
+                    ("Content-Type", "application/octet-stream"),
+                    ("Content-Disposition", 'attachment; filename="simulated_workload_telemetry.parquet"'),
+                    ("Content-Length", str(len(data))),
+                ])
+                return [data]
             else:
-                self.send_error(404, "Parquet file not found. Please run a simulation first.")
+                resp = b"Parquet file not found. Please run a simulation first.\n"
+                start_response("404 Not Found", [
+                    ("Content-Type", "text/plain"),
+                    ("Content-Length", str(len(resp))),
+                ])
+                return [resp]
 
         elif path in ("/api/image/timeline", "/sample_data/workload_timeline.png"):
             img_path = Path("/tmp/sample_data/workload_timeline.png")
@@ -749,24 +750,76 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
             if img_path.exists():
                 data = img_path.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "image/png")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                start_response("200 OK", [
+                    ("Content-Type", "image/png"),
+                    ("Content-Length", str(len(data))),
+                ])
+                return [data]
             else:
-                self.send_error(404, "Timeline image not found.")
+                resp = b"Timeline image not found.\n"
+                start_response("404 Not Found", [
+                    ("Content-Type", "text/plain"),
+                    ("Content-Length", str(len(resp))),
+                ])
+                return [resp]
 
         elif path in ("/healthz", "/health"):
             resp = b"OK\n"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(resp)))
-            self.end_headers()
-            self.wfile.write(resp)
+            start_response("200 OK", [
+                ("Content-Type", "text/plain"),
+                ("Content-Length", str(len(resp))),
+            ])
+            return [resp]
 
         else:
-            self.send_error(404, "Endpoint Not Found")
+            resp = b"404 Endpoint Not Found\n"
+            start_response("404 Not Found", [
+                ("Content-Type", "text/plain"),
+                ("Content-Length", str(len(resp))),
+            ])
+            return [resp]
+
+    except Exception as e:
+        import traceback
+        err_msg = f"Internal Server Error: {str(e)}\n\n{traceback.format_exc()}".encode("utf-8")
+        start_response("500 Internal Server Error", [
+            ("Content-Type", "text/plain; charset=utf-8"),
+            ("Content-Length", str(len(err_msg))),
+        ])
+        return [err_msg]
+
+
+class MetricsHandler(BaseHTTPRequestHandler):
+    """HTTP Request Handler serving Web Dashboard, REST APIs, and Prometheus metrics."""
+
+    def do_GET(self) -> None:
+        raw_path = self.path or "/"
+        parts = raw_path.split("?", 1)
+        path = parts[0]
+        query = parts[1] if len(parts) > 1 else ""
+
+        environ = {
+            "PATH_INFO": path,
+            "QUERY_STRING": query,
+            "REQUEST_METHOD": "GET",
+        }
+
+        resp_status = "200 OK"
+        resp_headers: List[Tuple[str, str]] = []
+
+        def start_response(status: str, headers: List[Tuple[str, str]]) -> None:
+            nonlocal resp_status, resp_headers
+            resp_status = status
+            resp_headers = headers
+
+        body_parts = wsgi_app(environ, start_response)
+        code = int(resp_status.split()[0])
+        self.send_response(code)
+        for h_name, h_val in resp_headers:
+            self.send_header(h_name, h_val)
+        self.end_headers()
+        for chunk in body_parts:
+            self.wfile.write(chunk)
 
     def log_message(self, format: str, *args: Any) -> None:
         """Suppress standard access logs to keep terminal readable."""
