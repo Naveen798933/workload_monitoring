@@ -1,8 +1,12 @@
 """Vercel root entrypoint for Serverless Functions and standalone execution."""
 
 from __future__ import annotations
+import os
 import sys
 from pathlib import Path
+
+# Ensure safe writable directory for Matplotlib cache on AWS Lambda / Vercel
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 # Add project root to sys.path
 root_dir = Path(__file__).resolve().parent

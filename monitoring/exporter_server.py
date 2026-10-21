@@ -18,7 +18,12 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+# Ensure safe writable directory for Matplotlib cache on AWS Lambda / Vercel
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
+import numpy as np
 
 # Add parent directory to sys.path if invoked directly
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -641,11 +646,34 @@ def get_shared_server() -> WorkloadMetricsServer:
 def wsgi_app(environ: Dict[str, Any], start_response: Any) -> List[bytes]:
     """Universal WSGI application entrypoint for Vercel, Gunicorn, and serverless."""
     server = get_shared_server()
-    path = environ.get("PATH_INFO", "/") or "/"
+    raw_path = (
+        environ.get("HTTP_X_MATCHED_PATH")
+        or environ.get("REQUEST_URI", "").split("?")[0]
+        or environ.get("RAW_URI", "").split("?")[0]
+        or environ.get("PATH_INFO", "/")
+        or "/"
+    )
+    raw_path = raw_path.strip()
+    if not raw_path.startswith("/"):
+        raw_path = "/" + raw_path
+
+    # Normalize path if routed or rewritten through /api/index or /api
+    if raw_path in ("/api/index", "/api", "/api/"):
+        path = "/"
+    elif raw_path.startswith("/api/index/"):
+        path = raw_path[len("/api/index"):]
+    else:
+        path = raw_path
+
     query_string = environ.get("QUERY_STRING", "")
     query = urllib.parse.parse_qs(query_string)
 
     try:
+        # Favicon handler
+        if path == "/favicon.ico":
+            start_response("204 No Content", [("Content-Length", "0")])
+            return []
+
         # 1. Prometheus Scrape Endpoint
         if path in ("/metrics", "/metrics/"):
             content = server.manager.scrape_latest()

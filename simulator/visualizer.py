@@ -6,6 +6,9 @@ and output destinations are all driven dynamically by configuration or method ar
 
 from __future__ import annotations
 import os
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
+
 # Ensure safe writable directory for Matplotlib cache on AWS Lambda / Vercel
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
