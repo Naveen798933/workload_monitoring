@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from simulator.config import load_config
 from simulator.generator import WorkloadGenerator
-from simulator.visualizer import WorkloadVisualizer
+# WorkloadVisualizer is lazily imported when generating images to eliminate serverless cold-start latency
 from model.engine import SimulationEngine
 from model.queue_system import QueuedRequest
 from monitoring.metrics import PrometheusMetricsManager
@@ -669,6 +669,14 @@ HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 """
 
 
+IS_SERVERLESS = bool(
+    os.environ.get("VERCEL")
+    or os.environ.get("VERCEL_ENV")
+    or os.environ.get("VERCEL_URL")
+    or os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+    or os.environ.get("LAMBDA_TASK_ROOT")
+)
+
 _SHARED_SERVER: Optional[WorkloadMetricsServer] = None
 
 
@@ -680,48 +688,108 @@ def get_shared_server() -> WorkloadMetricsServer:
     return _SHARED_SERVER
 
 
+def resolve_request_path(environ: Dict[str, Any]) -> str:
+    """Extracts the true client request path across Vercel, AWS Lambda, WSGI, and standard HTTP servers."""
+    candidates = [
+        environ.get("HTTP_X_FORWARDED_URI"),
+        environ.get("HTTP_X_REAL_REQUEST_URI"),
+        environ.get("REQUEST_URI"),
+        environ.get("RAW_URI"),
+        environ.get("PATH_INFO"),
+    ]
+    selected_path = ""
+    for candidate in candidates:
+        if candidate and isinstance(candidate, str):
+            clean = candidate.split("?")[0].strip()
+            if clean and clean not in ("/api/index.py", "/index.py", "/api/index"):
+                selected_path = clean
+                break
+
+    if not selected_path:
+        selected_path = (environ.get("PATH_INFO") or "/").split("?")[0].strip()
+
+    if not selected_path.startswith("/"):
+        selected_path = "/" + selected_path
+
+    # Clean any internal script-name prefixes
+    for prefix in ("/api/index.py", "/index.py", "/api/index"):
+        if selected_path == prefix:
+            selected_path = "/"
+            break
+        elif selected_path.startswith(prefix + "/"):
+            selected_path = selected_path[len(prefix):]
+            break
+
+    return selected_path or "/"
+
+
 def wsgi_app(environ: Dict[str, Any], start_response: Any) -> List[bytes]:
     """Universal WSGI application entrypoint for Vercel, Gunicorn, and serverless."""
     server = get_shared_server()
-    raw_path = (
-        environ.get("HTTP_X_MATCHED_PATH")
-        or environ.get("REQUEST_URI", "").split("?")[0]
-        or environ.get("RAW_URI", "").split("?")[0]
-        or environ.get("PATH_INFO", "/")
-        or "/"
-    )
-    raw_path = raw_path.strip()
-    if not raw_path.startswith("/"):
-        raw_path = "/" + raw_path
 
-    # Normalize path if routed or rewritten through /api/index or /api
-    if raw_path in ("/api/index", "/api", "/api/"):
-        path = "/"
-    elif raw_path.startswith("/api/index/"):
-        path = raw_path[len("/api/index"):]
-    else:
-        path = raw_path
-
+    # Determine requested path reliably
+    path = resolve_request_path(environ)
     query_string = environ.get("QUERY_STRING", "")
     query = urllib.parse.parse_qs(query_string)
 
     try:
+        # Handle CORS preflight
+        if environ.get("REQUEST_METHOD") == "OPTIONS":
+            start_response("204 No Content", [
+                ("Access-Control-Allow-Origin", "*"),
+                ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+                ("Access-Control-Allow-Headers", "Content-Type, Authorization"),
+                ("Content-Length", "0"),
+            ])
+            return []
+
+        # Handle POST requests (Workload Ingestion API)
+        if environ.get("REQUEST_METHOD") == "POST" or path in (
+            "/api/v1/workload/ingest", "/v1/workload/ingest",
+            "/api/ingest", "/ingest",
+            "/api/v1/tasks/submit", "/tasks/submit"
+        ):
+            try:
+                content_len = int(environ.get("CONTENT_LENGTH") or 0)
+                body = environ["wsgi.input"].read(content_len) if content_len > 0 and "wsgi.input" in environ else b"{}"
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                rate = float(payload.get("request_rate_rps", 50.0))
+                count = int(payload.get("request_count", 1))
+                priority = int(payload.get("priority", 1))
+                res = server.ingest_real_workload(rate, count, priority)
+                resp_bytes = json.dumps(res).encode("utf-8")
+                start_response("200 OK", [
+                    ("Content-Type", "application/json"),
+                    ("Access-Control-Allow-Origin", "*"),
+                    ("Content-Length", str(len(resp_bytes))),
+                ])
+                return [resp_bytes]
+            except Exception as e:
+                err = json.dumps({"error": str(e)}).encode("utf-8")
+                start_response("400 Bad Request", [
+                    ("Content-Type", "application/json"),
+                    ("Access-Control-Allow-Origin", "*"),
+                    ("Content-Length", str(len(err))),
+                ])
+                return [err]
+
         # Favicon handler
         if path == "/favicon.ico":
             start_response("204 No Content", [("Content-Length", "0")])
             return []
 
         # 1. Prometheus Scrape Endpoint
-        if path in ("/metrics", "/metrics/"):
+        if path in ("/metrics", "/metrics/", "/api/metrics"):
             content = server.manager.scrape_latest()
             start_response("200 OK", [
                 ("Content-Type", "text/plain; version=0.0.4; charset=utf-8"),
+                ("Access-Control-Allow-Origin", "*"),
                 ("Content-Length", str(len(content))),
             ])
             return [content]
 
         # 2. Web UI Dashboard Root
-        elif path in ("/", "/dashboard"):
+        elif path in ("/", "/dashboard", "/index.html", "/api/dashboard"):
             html_bytes = HTML_DASHBOARD_TEMPLATE.encode("utf-8")
             start_response("200 OK", [
                 ("Content-Type", "text/html; charset=utf-8"),
@@ -730,17 +798,18 @@ def wsgi_app(environ: Dict[str, Any], start_response: Any) -> List[bytes]:
             return [html_bytes]
 
         # 3. Telemetry JSON API
-        elif path == "/api/telemetry":
+        elif path in ("/api/telemetry", "/telemetry", "/api/v1/telemetry"):
             payload = server.get_current_telemetry_payload()
             json_bytes = json.dumps(payload).encode("utf-8")
             start_response("200 OK", [
                 ("Content-Type", "application/json"),
+                ("Access-Control-Allow-Origin", "*"),
                 ("Content-Length", str(len(json_bytes))),
             ])
             return [json_bytes]
 
         # 4. Trigger Simulation Run API
-        elif path == "/api/simulate":
+        elif path in ("/api/simulate", "/simulate", "/api/v1/simulate"):
             pattern = query.get("pattern", ["composite"])[0]
             duration = float(query.get("duration", [120])[0])
             seed = int(query.get("seed", [42])[0])
@@ -751,64 +820,67 @@ def wsgi_app(environ: Dict[str, Any], start_response: Any) -> List[bytes]:
             json_bytes = json.dumps(payload).encode("utf-8")
             start_response("200 OK", [
                 ("Content-Type", "application/json"),
+                ("Access-Control-Allow-Origin", "*"),
                 ("Content-Length", str(len(json_bytes))),
             ])
             return [json_bytes]
 
         # 5. Live Tick API
-        elif path == "/api/live-tick":
+        elif path in ("/api/live-tick", "/live-tick", "/api/v1/live-tick"):
             payload = server.advance_live_tick()
             json_bytes = json.dumps(payload).encode("utf-8")
             start_response("200 OK", [
                 ("Content-Type", "application/json"),
+                ("Access-Control-Allow-Origin", "*"),
                 ("Content-Length", str(len(json_bytes))),
             ])
             return [json_bytes]
 
         # 6. File Downloads (CSV, Parquet, Image)
-        elif path in ("/api/download/csv", "/sample_data/simulated_workload_telemetry.csv"):
+        elif path in ("/api/download/csv", "/download/csv", "/sample_data/simulated_workload_telemetry.csv"):
             csv_path = Path("/tmp/sample_data/simulated_workload_telemetry.csv")
             if not csv_path.exists():
                 csv_path = Path("sample_data/simulated_workload_telemetry.csv")
 
             if csv_path.exists():
                 data = csv_path.read_bytes()
-                start_response("200 OK", [
-                    ("Content-Type", "text/csv"),
-                    ("Content-Disposition", 'attachment; filename="simulated_workload_telemetry.csv"'),
-                    ("Content-Length", str(len(data))),
-                ])
-                return [data]
             else:
-                resp = b"CSV file not found. Please run a simulation first.\n"
-                start_response("404 Not Found", [
-                    ("Content-Type", "text/plain"),
-                    ("Content-Length", str(len(resp))),
-                ])
-                return [resp]
+                import pandas as pd
+                df = pd.DataFrame(server.cached_records)
+                data = df.to_csv(index=False).encode("utf-8")
 
-        elif path in ("/api/download/parquet", "/sample_data/simulated_workload_telemetry.parquet"):
+            start_response("200 OK", [
+                ("Content-Type", "text/csv"),
+                ("Content-Disposition", 'attachment; filename="simulated_workload_telemetry.csv"'),
+                ("Access-Control-Allow-Origin", "*"),
+                ("Content-Length", str(len(data))),
+            ])
+            return [data]
+
+        elif path in ("/api/download/parquet", "/download/parquet", "/sample_data/simulated_workload_telemetry.parquet"):
             pq_path = Path("/tmp/sample_data/simulated_workload_telemetry.parquet")
             if not pq_path.exists():
                 pq_path = Path("sample_data/simulated_workload_telemetry.parquet")
 
             if pq_path.exists():
                 data = pq_path.read_bytes()
-                start_response("200 OK", [
-                    ("Content-Type", "application/octet-stream"),
-                    ("Content-Disposition", 'attachment; filename="simulated_workload_telemetry.parquet"'),
-                    ("Content-Length", str(len(data))),
-                ])
-                return [data]
             else:
-                resp = b"Parquet file not found. Please run a simulation first.\n"
-                start_response("404 Not Found", [
-                    ("Content-Type", "text/plain"),
-                    ("Content-Length", str(len(resp))),
-                ])
-                return [resp]
+                import io
+                import pandas as pd
+                df = pd.DataFrame(server.cached_records)
+                buf = io.BytesIO()
+                df.to_parquet(buf, index=False)
+                data = buf.getvalue()
 
-        elif path in ("/api/image/timeline", "/sample_data/workload_timeline.png"):
+            start_response("200 OK", [
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Disposition", 'attachment; filename="simulated_workload_telemetry.parquet"'),
+                ("Access-Control-Allow-Origin", "*"),
+                ("Content-Length", str(len(data))),
+            ])
+            return [data]
+
+        elif path in ("/api/image/timeline", "/image/timeline", "/sample_data/workload_timeline.png"):
             img_path = Path("/tmp/sample_data/workload_timeline.png")
             if not img_path.exists():
                 img_path = Path("sample_data/workload_timeline.png")
@@ -817,21 +889,41 @@ def wsgi_app(environ: Dict[str, Any], start_response: Any) -> List[bytes]:
                 data = img_path.read_bytes()
                 start_response("200 OK", [
                     ("Content-Type", "image/png"),
+                    ("Access-Control-Allow-Origin", "*"),
                     ("Content-Length", str(len(data))),
                 ])
                 return [data]
             else:
-                resp = b"Timeline image not found.\n"
-                start_response("404 Not Found", [
-                    ("Content-Type", "text/plain"),
-                    ("Content-Length", str(len(resp))),
-                ])
-                return [resp]
+                try:
+                    out_dir = Path("/tmp/sample_data") if IS_SERVERLESS else Path("sample_data")
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    from simulator.visualizer import WorkloadVisualizer
+                    import pandas as pd
+                    vis = WorkloadVisualizer(config=server.config)
+                    df = pd.DataFrame(server.cached_records)
+                    target = out_dir / "workload_timeline.png"
+                    vis.plot_timeline(df, target)
+                    data = target.read_bytes()
+                    start_response("200 OK", [
+                        ("Content-Type", "image/png"),
+                        ("Access-Control-Allow-Origin", "*"),
+                        ("Content-Length", str(len(data))),
+                    ])
+                    return [data]
+                except Exception:
+                    resp = b"Timeline image not found or generating.\n"
+                    start_response("404 Not Found", [
+                        ("Content-Type", "text/plain"),
+                        ("Access-Control-Allow-Origin", "*"),
+                        ("Content-Length", str(len(resp))),
+                    ])
+                    return [resp]
 
-        elif path in ("/healthz", "/health"):
+        elif path in ("/healthz", "/health", "/api/health"):
             resp = b"OK\n"
             start_response("200 OK", [
                 ("Content-Type", "text/plain"),
+                ("Access-Control-Allow-Origin", "*"),
                 ("Content-Length", str(len(resp))),
             ])
             return [resp]
@@ -840,6 +932,7 @@ def wsgi_app(environ: Dict[str, Any], start_response: Any) -> List[bytes]:
             resp = b"404 Endpoint Not Found\n"
             start_response("404 Not Found", [
                 ("Content-Type", "text/plain"),
+                ("Access-Control-Allow-Origin", "*"),
                 ("Content-Length", str(len(resp))),
             ])
             return [resp]
@@ -849,6 +942,7 @@ def wsgi_app(environ: Dict[str, Any], start_response: Any) -> List[bytes]:
         err_msg = f"Internal Server Error: {str(e)}\n\n{traceback.format_exc()}".encode("utf-8")
         start_response("500 Internal Server Error", [
             ("Content-Type", "text/plain; charset=utf-8"),
+            ("Access-Control-Allow-Origin", "*"),
             ("Content-Length", str(len(err_msg))),
         ])
         return [err_msg]
@@ -856,6 +950,14 @@ def wsgi_app(environ: Dict[str, Any], start_response: Any) -> List[bytes]:
 
 class MetricsHandler(BaseHTTPRequestHandler):
     """HTTP Request Handler serving Web Dashboard, SSE streams, Ingestion APIs, and Prometheus metrics."""
+
+    def do_OPTIONS(self) -> None:
+        """Handle CORS preflight requests."""
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.end_headers()
 
     def do_GET(self) -> None:
         raw_path = self.path or "/"
@@ -865,6 +967,12 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
         # Real-time Server-Sent Events (SSE) telemetry stream
         if path in ("/api/v1/stream", "/api/stream"):
+            if IS_SERVERLESS:
+                self.send_response(204)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                return
+
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -912,37 +1020,36 @@ class MetricsHandler(BaseHTTPRequestHandler):
         raw_path = self.path or "/"
         parts = raw_path.split("?", 1)
         path = parts[0]
+        query = parts[1] if len(parts) > 1 else ""
 
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else b"{}"
 
-        server = get_shared_server()
-        if path in ("/api/v1/workload/ingest", "/api/ingest", "/api/v1/tasks/submit"):
-            try:
-                payload = json.loads(body.decode("utf-8")) if body else {}
-                rate = float(payload.get("request_rate_rps", 50.0))
-                count = int(payload.get("request_count", 1))
-                priority = int(payload.get("priority", 1))
-                res = server.ingest_real_workload(rate, count, priority)
-                resp_bytes = json.dumps(res).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Content-Length", str(len(resp_bytes)))
-                self.end_headers()
-                self.wfile.write(resp_bytes)
-                return
-            except Exception as e:
-                err = json.dumps({"error": str(e)}).encode("utf-8")
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(err)))
-                self.end_headers()
-                self.wfile.write(err)
-                return
+        import io
+        environ = {
+            "PATH_INFO": path,
+            "QUERY_STRING": query,
+            "REQUEST_METHOD": "POST",
+            "CONTENT_LENGTH": str(len(body)),
+            "wsgi.input": io.BytesIO(body),
+        }
 
-        self.send_response(404)
+        resp_status = "200 OK"
+        resp_headers: List[Tuple[str, str]] = []
+
+        def start_response(status: str, headers: List[Tuple[str, str]]) -> None:
+            nonlocal resp_status, resp_headers
+            resp_status = status
+            resp_headers = headers
+
+        body_parts = wsgi_app(environ, start_response)
+        code = int(resp_status.split()[0])
+        self.send_response(code)
+        for h_name, h_val in resp_headers:
+            self.send_header(h_name, h_val)
         self.end_headers()
+        for chunk in body_parts:
+            self.wfile.write(chunk)
 
     def log_message(self, format: str, *args: Any) -> None:
         """Suppress standard access logs to keep terminal readable."""
@@ -973,11 +1080,14 @@ class WorkloadMetricsServer:
         self.live_engine: Optional[SimulationEngine] = None
         self.live_generator: Optional[WorkloadGenerator] = None
 
-        # Seed initial cache safely (non-blocking for serverless cold start)
-        try:
-            self.run_and_cache_simulation()
-        except Exception:
+        # Seed initial cache safely (instant non-blocking initialization for serverless cold start)
+        if IS_SERVERLESS:
             self._seed_default_cache()
+        else:
+            try:
+                self.run_and_cache_simulation()
+            except Exception:
+                self._seed_default_cache()
 
     def _seed_default_cache(self) -> None:
         """Lightweight in-memory synthetic telemetry for cold starts."""
@@ -1015,6 +1125,14 @@ class WorkloadMetricsServer:
                 "workers_draining": 0,
                 "workers_capacity_rps": 100.0,
             })
+        # Fast 1-step initialization of Prometheus metric gauges
+        try:
+            if not self.live_engine:
+                self.live_engine = SimulationEngine(config=self.config, random_seed=42)
+            init_record = self.live_engine.step(0.0, 50.0)
+            self.manager.update_from_record(init_record)
+        except Exception:
+            pass
 
     def run_and_cache_simulation(
         self,
@@ -1023,6 +1141,9 @@ class WorkloadMetricsServer:
         seed: int = 42,
     ) -> Dict[str, Any]:
         """Runs the simulation, updates Prometheus metrics, exports datasets, and caches JSON."""
+        if IS_SERVERLESS:
+            duration = min(float(duration), 30.0)
+
         gen = WorkloadGenerator(config=self.config, random_seed=seed)
         gen.duration_seconds = duration
         traffic_df = gen.generate(pattern_type=pattern)
@@ -1036,15 +1157,25 @@ class WorkloadMetricsServer:
             self.manager.update_from_record(r)
 
         # Export to files safely (serverless read-only filesystem handling)
-        out_dir = Path("/tmp/sample_data") if os.environ.get("VERCEL") else Path("sample_data")
-        try:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            export_dataset_to_csv(telemetry_df, out_dir / "simulated_workload_telemetry.csv")
-            export_dataset_to_parquet(telemetry_df, out_dir / "simulated_workload_telemetry.parquet")
-            vis = WorkloadVisualizer(config=self.config)
-            vis.plot_timeline(telemetry_df, out_dir / "workload_timeline.png")
-        except Exception:
-            pass  # Fall back to in-memory cache if local disk is read-only
+        if not IS_SERVERLESS:
+            out_dir = Path("sample_data")
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                export_dataset_to_csv(telemetry_df, out_dir / "simulated_workload_telemetry.csv")
+                export_dataset_to_parquet(telemetry_df, out_dir / "simulated_workload_telemetry.parquet")
+                from simulator.visualizer import WorkloadVisualizer
+                vis = WorkloadVisualizer(config=self.config)
+                vis.plot_timeline(telemetry_df, out_dir / "workload_timeline.png")
+            except Exception:
+                pass
+        else:
+            out_dir = Path("/tmp/sample_data")
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                export_dataset_to_csv(telemetry_df, out_dir / "simulated_workload_telemetry.csv")
+                export_dataset_to_parquet(telemetry_df, out_dir / "simulated_workload_telemetry.parquet")
+            except Exception:
+                pass
 
         self.cached_records = telemetry_df.to_dict(orient="records")
         return {"pattern": pattern, "records": self.cached_records}

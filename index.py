@@ -17,6 +17,7 @@ from monitoring.exporter_server import wsgi_app, MetricsHandler, get_shared_serv
 
 # Universal WSGI application entrypoint for Vercel
 app = wsgi_app
+application = wsgi_app
 
 # BaseHTTPRequestHandler class for Vercel
 handler = MetricsHandler
