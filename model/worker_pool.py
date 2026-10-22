@@ -208,21 +208,33 @@ class WorkerPool:
         ready_count = len(self.get_ready_workers())
         return ready_count * self.throughput_per_worker_rps
 
-    def compute_cpu_utilization(self) -> float:
-        """Computes aggregate CPU utilization ratio (0.0 to 1.0)."""
+    def compute_cpu_utilization(self, current_throughput_rps: Optional[float] = None) -> float:
+        """Computes aggregate CPU utilization ratio (0.0 to 1.0).
+
+        Combines baseline idle usage (2%) with throughput saturation
+        (current_rps / total_capacity_rps), with fallback to concurrency slots.
+        """
         ready = self.get_ready_workers()
         if not ready:
             return 0.0
+
+        total_capacity = self.get_total_capacity_rps()
+        base_idle = 0.02
+
+        if current_throughput_rps is not None and total_capacity > 0:
+            load_ratio = min(1.0, max(0.0, current_throughput_rps / total_capacity))
+            utilization = base_idle + (1.0 - base_idle) * load_ratio
+            return float(round(min(1.0, max(0.0, utilization)), 4))
 
         total_concurrency_slots = sum(w.max_concurrency for w in ready)
         if total_concurrency_slots == 0:
             return 0.0
 
         active_slots = sum(w.active_requests for w in ready)
-        # Ratio of active concurrency slots, with non-zero idle baseline (e.g., 2% system idle)
-        base_idle = 0.02
-        raw_ratio = base_idle + (1.0 - base_idle) * (active_slots / total_concurrency_slots)
-        return float(min(1.0, max(0.0, raw_ratio)))
+        # Normalize active slots by the expected concurrency at full throughput
+        expected_concurrency_at_capacity = max(1.0, len(ready) * (self.throughput_per_worker_rps * 0.04))
+        raw_ratio = base_idle + (1.0 - base_idle) * min(1.0, active_slots / expected_concurrency_at_capacity)
+        return float(round(min(1.0, max(0.0, raw_ratio)), 4))
 
     def compute_memory_metrics(self) -> Tuple[float, float, float]:
         """Computes (memory_used_mb, memory_total_mb, memory_utilization_ratio)."""

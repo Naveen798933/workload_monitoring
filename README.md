@@ -65,7 +65,7 @@ Every operational parameter is decoupled from logic files and resolved via a str
    - `SIM_EXPORT_FORMAT`: `csv`, `parquet`, or `both`.
    - `TRAFFIC_PATTERN`: `steady`, `spike`, `gradual`, `noisy`, or `composite`.
    - `METRICS_PORT`: Bind port for Prometheus HTTP exporter (default: `8000`).
-3. **External Configuration File:** [`config.yaml`](file:///c:/Users/K%20Yagnasri/OneDrive/Desktop/member%201%20_Workload%20monitoring/config.yaml).
+3. **External Configuration File:** [`config.yaml`](config.yaml).
 
 ---
 
@@ -73,88 +73,85 @@ Every operational parameter is decoupled from logic files and resolved via a str
 
 ### 1. Setup Virtual Environment & Install Dependencies
 ```bash
-# Activate existing virtual environment
+# macOS / Linux
+python3 -m venv venv
+source venv/bin/activate
+
+# Windows (PowerShell)
 .\venv\Scripts\Activate.ps1
 
-# Or install dependencies from requirements.txt
+# Install production dependencies
 pip install -r requirements.txt
 ```
 
-### 2. Run the Full End-to-End Pipeline
+### 2. Run the Real-Time Web Dashboard & Prometheus Exporter
+```bash
+python web_server.py 8000
+```
+- **Real-Time Interactive Dashboard:** [http://localhost:8000/](http://localhost:8000/)
+- **Live SSE Telemetry Stream:** [http://localhost:8000/api/v1/stream](http://localhost:8000/api/v1/stream)
+- **Live Workload Ingestion:** `POST http://localhost:8000/api/v1/workload/ingest`
+- **Prometheus Metrics:** [http://localhost:8000/metrics](http://localhost:8000/metrics)
+
+### 3. Run the Full End-to-End Test Suite
 ```bash
 python run_demo.py
 ```
-This executes:
-- Traffic generation across all 5 pattern models.
-- Discrete-event simulation with elastic worker pool and request queues.
-- Export of telemetry datasets to CSV and Parquet formats.
-- Bi-directional Pydantic schema validation.
-- Generation of the 4-panel Matplotlib timeline visualization.
-- Launch of the Prometheus exporter server and live metric scraping verification.
 
 ---
 
 ## 📊 Task Breakdown
 
-### Task 1: Workload Simulator
+### Task 1: Workload Simulator & Generator
 - **Traffic Patterns:**
   - **Steady:** Baseline load with controllable Gaussian/Poisson variance.
   - **Spike:** Sudden surges with configurable amplitude, duration, and exponential decay.
   - **Gradual:** Diurnal sinusoidal waves or linear ramps.
   - **Noisy:** Mean-reverting stochastic processes (Ornstein-Uhlenbeck / Gaussian random walk).
-  - **Composite:** Diurnal baseline overlaid with periodic bursts and stochastic jitter.
-- **Reproducibility:** Seed-driven pseudo-random generator guarantees bit-for-bit identical traces across runs.
+  - **Composite:** Diurnal baseline overlaid with periodic bursts and smooth decay.
 - **CLI Usage:**
   ```bash
   python simulator/run_simulation.py --config config.yaml --pattern composite --duration 120 --seed 42 --export-format both
   ```
 
 ### Task 2: Resource and Performance Model
-- **Queue Subsystem ([`model/queue_system.py`](file:///c:/Users/K%20Yagnasri/OneDrive/Desktop/member%201%20_Workload%20monitoring/model/queue_system.py)):**
-  - FIFO and Priority Queues.
-  - Drop Policies: `DROP_TAIL` (discard incoming), `DROP_HEAD` (evict oldest), `REJECT` (immediate refusal).
+- **Queue Subsystem ([`model/queue_system.py`](model/queue_system.py)):**
+  - Thread-safe FIFO and Priority Queues with `threading.RLock()`.
+  - Drop Policies: `DROP_TAIL` (discard incoming), `DROP_HEAD` (evict lowest priority), `REJECT` (immediate 503).
   - Automatic timeout purging of expired requests.
-- **Worker Pool Cluster ([`model/worker_pool.py`](file:///c:/Users/K%20Yagnasri/OneDrive/Desktop/member%201%20_Workload%20monitoring/model/worker_pool.py)):**
+- **Worker Pool Cluster ([`model/worker_pool.py`](model/worker_pool.py)):**
   - Worker lifecycle: `INITIALIZING` ➔ `WARMING_UP` ➔ `READY` ➔ `BUSY` ➔ `DRAINING` ➔ `STOPPED`.
   - Cold-start latency and graceful drain timeouts.
-  - Dynamic auto-scaling based on CPU threshold and queue backlog.
-- **Simulation Engine ([`model/engine.py`](file:///c:/Users/K%20Yagnasri/OneDrive/Desktop/member%201%20_Workload%20monitoring/model/engine.py)):**
-  - Concurrency penalty modeling.
-  - Service latency distributions: Lognormal, Exponential, and Normal.
-  - Accurate percentile computation ($p_{50}, p_{90}, p_{95}, p_{99}, \max, \min$).
+  - Dynamic auto-scaling based on true capacity-ratio CPU threshold and queue backlog.
+- **Simulation Engine ([`model/engine.py`](model/engine.py)):**
+  - Exact request remainder distribution across workers.
+  - Latency distributions: Lognormal, Exponential, and Normal with monotonic percentile guarantees.
 
 ### Task 3: Monitoring & Observability
-- **Prometheus Collectors ([`monitoring/metrics.py`](file:///c:/Users/K%20Yagnasri/OneDrive/Desktop/member%201%20_Workload%20monitoring/monitoring/metrics.py)):**
+- **Prometheus Collectors ([`monitoring/metrics.py`](monitoring/metrics.py)):**
   - `workload_requests_total{status, endpoint}`: Throughput counter.
   - `workload_dropped_requests_total{reason}`: Drop counter.
+  - `workload_latency_p50_seconds`, `workload_latency_p95_seconds`, `workload_latency_p99_seconds`: Dedicated quantile gauges.
   - `workload_active_workers{state}`: Gauge for worker lifecycle counts.
   - `workload_queue_depth` & `workload_queue_max_capacity`: Queue backpressure gauges.
   - `workload_cpu_utilization_ratio` & `workload_memory_used_bytes`: Resource utilization gauges.
-  - `workload_request_duration_seconds`: Service latency histogram.
-- **HTTP Exporter ([`monitoring/exporter_server.py`](file:///c:/Users/K%20Yagnasri/OneDrive/Desktop/member%201%20_Workload%20monitoring/monitoring/exporter_server.py)):**
-  - Run standalone exporter:
-    ```bash
-    python monitoring/exporter_server.py --port 8000 --live-feed --duration 60
-    ```
-- **Prometheus Scraping Setup:** Target configured in [`monitoring/prometheus.yml`](file:///c:/Users/K%20Yagnasri/OneDrive/Desktop/member%201%20_Workload%20monitoring/monitoring/prometheus.yml).
-- **Grafana Dashboard:** Declarative JSON schema in [`monitoring/grafana_dashboard.json`](file:///c:/Users/K%20Yagnasri/OneDrive/Desktop/member%201%20_Workload%20monitoring/monitoring/grafana_dashboard.json) featuring:
-  1. Real-time traffic throughput vs capacity.
-  2. Latency distributions ($p_{50}/p_{95}/p_{99}$).
-  3. Resource utilization (CPU % and Memory %).
-  4. Queue backpressure and dropped request rates.
+- **HTTP Exporter & Streamer ([`monitoring/exporter_server.py`](monitoring/exporter_server.py)):**
+  - Multi-threaded `ThreadingHTTPServer` with Server-Sent Events (`/api/v1/stream`) and real workload ingestion (`/api/v1/workload/ingest`).
+- **Prometheus Scraping Setup:** Target configured in [`monitoring/prometheus.yml`](monitoring/prometheus.yml).
+- **Grafana Dashboard:** Declarative JSON schema in [`monitoring/grafana_dashboard.json`](monitoring/grafana_dashboard.json).
 - **Fidelity Verification:**
   ```bash
   python monitoring/verify_metrics.py
   ```
 
 ### Task 4: Shared Data Interface
-- **Pydantic Validation ([`interface/schema.py`](file:///c:/Users/K%20Yagnasri/OneDrive/Desktop/member%201%20_Workload%20monitoring/interface/schema.py)):**
+- **Pydantic Validation ([`interface/schema.py`](interface/schema.py)):**
   - Physical unit enforcements (`MetricUnit`).
   - Monotonic percentile order ($p_{50} \le p_{90} \le p_{95} \le p_{99} \le \max$).
   - Strict resource bounds ($0.0 \le \text{CPU ratio} \le 1.0$, $\text{memory used} \le \text{memory total}$).
-  - Monotonic timestamp sequences.
-- **Data Dictionary:** Complete column definitions, ranges, and missing-value handling in [`interface/data_dictionary.md`](file:///c:/Users/K%20Yagnasri/OneDrive/Desktop/member%201%20_Workload%20monitoring/interface/data_dictionary.md).
-- **Tabular Serialization:** Bi-directional converters between Pydantic records, Pandas DataFrames, CSV, and Apache Parquet in [`interface/validator.py`](file:///c:/Users/K%20Yagnasri/OneDrive/Desktop/member%201%20_Workload%20monitoring/interface/validator.py).
+  - Timezone-aware UTC timestamp sequences.
+- **Data Dictionary:** Complete column definitions, ranges, and missing-value handling in [`interface/data_dictionary.md`](interface/data_dictionary.md).
+- **Tabular Serialization:** Bi-directional converters between Pydantic records, Pandas DataFrames, CSV, and Apache Parquet in [`interface/validator.py`](interface/validator.py).
 
 ---
 

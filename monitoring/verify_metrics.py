@@ -84,6 +84,13 @@ def verify_telemetry_fidelity() -> bool:
         f"Ready worker mismatch: Prometheus={ready_workers}, Simulator={record.workers.ready_workers}"
     )
 
+    # 6. Verify latency p50 quantile gauge
+    lat_p50 = parsed.get("workload_latency_p50_seconds")
+    assert lat_p50 is not None, "Missing metric: workload_latency_p50_seconds"
+    assert abs(lat_p50 - (record.latency.p50_ms / 1000.0)) < 1e-4, (
+        f"Latency p50 mismatch: Prometheus={lat_p50}, Simulator={record.latency.p50_ms / 1000.0}"
+    )
+
     print("[Verification] PASSED: All Prometheus scraped metrics exactly match simulator raw output!")
     return True
 

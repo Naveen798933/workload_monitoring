@@ -76,17 +76,17 @@
       "datasource": "Prometheus",
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(workload_request_duration_seconds_bucket[1m])) by (le)) * 1000",
+          "expr": "workload_latency_p50_seconds * 1000",
           "legendFormat": "p50 Median Latency",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, sum(rate(workload_request_duration_seconds_bucket[1m])) by (le)) * 1000",
+          "expr": "workload_latency_p95_seconds * 1000",
           "legendFormat": "p95 Tail Latency",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, sum(rate(workload_request_duration_seconds_bucket[1m])) by (le)) * 1000",
+          "expr": "workload_latency_p99_seconds * 1000",
           "legendFormat": "p99 Worst Case Latency",
           "refId": "C"
         }

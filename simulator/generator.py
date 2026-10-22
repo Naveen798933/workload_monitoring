@@ -38,6 +38,7 @@ class WorkloadGenerator:
 
     def _init_rng(self) -> None:
         """Initializes the NumPy pseudo-random number generator for reproducibility."""
+        self._stochastic_state: Optional[float] = None
         if self.random_seed is not None:
             self.rng = np.random.default_rng(self.random_seed)
         else:
@@ -138,21 +139,30 @@ class WorkloadGenerator:
         min_rps: float = float(p.get("min_rps", 5.0))
         max_rps: float = float(p.get("max_rps", 250.0))
         noise_type: str = str(p.get("noise_type", "gaussian_walk")).lower()
-
-        traffic = np.zeros(len(timeline), dtype=np.float64)
-        traffic[0] = baseline
         dt = self.time_step_seconds
+        traffic = np.zeros(len(timeline), dtype=np.float64)
 
+        if len(timeline) == 1:
+            prev_val = self._stochastic_state if self._stochastic_state is not None else baseline
+            if noise_type == "poisson":
+                cur_val = float(self.rng.poisson(lam=max(baseline, 1.0)))
+            else:
+                dx = theta * (baseline - prev_val) * dt + volatility * np.sqrt(dt) * self.rng.normal()
+                cur_val = float(prev_val + dx)
+            self._stochastic_state = float(np.clip(cur_val, min_rps, max_rps))
+            traffic[0] = self._stochastic_state
+            return traffic
+
+        traffic[0] = self._stochastic_state if self._stochastic_state is not None else baseline
         for i in range(1, len(timeline)):
             if noise_type == "poisson":
                 sample = self.rng.poisson(lam=max(baseline, 1.0))
                 traffic[i] = sample
             else:
-                # Ornstein-Uhlenbeck mean-reverting process:
-                # dX = theta * (mu - X) * dt + sigma * dW
                 dx = theta * (baseline - traffic[i - 1]) * dt + volatility * np.sqrt(dt) * self.rng.normal()
                 traffic[i] = traffic[i - 1] + dx
 
+        self._stochastic_state = float(traffic[-1])
         return np.clip(traffic, min_rps, max_rps)
 
     def generate_composite(
@@ -174,16 +184,20 @@ class WorkloadGenerator:
 
         traffic = base.copy()
 
-        # Add periodic or stochastic spikes
+        # Add periodic or stochastic spikes with smooth exponential decay
         if enable_spikes:
             interval = float(p.get("spike_trigger_interval_sec", 45.0))
             spike_len = float(p.get("spike_length_sec", 15.0))
             multiplier = float(p.get("spike_magnitude_multiplier", 3.0))
+            decay_rate = float(p.get("decay_rate", 0.15))
 
             for t_idx, t in enumerate(timeline):
                 cycle_time = t % interval
                 if cycle_time < spike_len:
                     traffic[t_idx] += base[t_idx] * (multiplier - 1.0)
+                else:
+                    decay = np.exp(-decay_rate * (cycle_time - spike_len))
+                    traffic[t_idx] += base[t_idx] * (multiplier - 1.0) * decay
 
         # Add stochastic noise overlay
         if enable_noise:

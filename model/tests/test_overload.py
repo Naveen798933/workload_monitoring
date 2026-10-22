@@ -41,6 +41,22 @@ def test_drop_head_policy():
     assert q.dequeue(current_time=1.2).request_id == "req-new"
 
 
+def test_drop_head_priority_policy():
+    """Verify DROP_HEAD on priority queue evicts lowest priority item (highest priority number)."""
+    q = RequestQueue(queue_type="PRIORITY", max_capacity=2, drop_policy="DROP_HEAD")
+    q.enqueue(QueuedRequest.create("high-pri", arrival_time=1.0, priority=1), current_time=1.0)
+    q.enqueue(QueuedRequest.create("low-pri", arrival_time=1.0, priority=10), current_time=1.0)
+
+    # 3rd request should evict low-pri
+    accepted, dropped, reason = q.enqueue(QueuedRequest.create("med-pri", arrival_time=1.1, priority=5), current_time=1.1)
+    assert accepted
+    assert dropped.request_id == "low-pri"
+    assert reason == DropReasonEnum.QUEUE_OVERFLOW
+    assert q.depth == 2
+    assert q.dequeue(current_time=1.2).request_id == "high-pri"
+    assert q.dequeue(current_time=1.2).request_id == "med-pri"
+
+
 def test_request_timeout_expiration():
     """Verify requests lingering in queue past timeout deadline are purged."""
     q = RequestQueue(queue_type="FIFO", max_capacity=10, request_timeout_sec=2.0)

@@ -9,7 +9,7 @@ This module establishes strict data schemas for:
 from __future__ import annotations
 from enum import Enum
 from typing import Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -201,7 +201,7 @@ class WorkloadDatasetMetadata(BaseModel):
     duration_seconds: float = Field(..., gt=0.0)
     time_step_seconds: float = Field(..., gt=0.0)
     random_seed: Optional[int] = None
-    created_at_utc: datetime = Field(default_factory=datetime.utcnow)
+    created_at_utc: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     version: str = Field(default="1.0.0")
 
 

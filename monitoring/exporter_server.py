@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -32,6 +32,7 @@ from simulator.config import load_config
 from simulator.generator import WorkloadGenerator
 from simulator.visualizer import WorkloadVisualizer
 from model.engine import SimulationEngine
+from model.queue_system import QueuedRequest
 from monitoring.metrics import PrometheusMetricsManager
 from interface.validator import (
     records_to_dataframe,
@@ -593,29 +594,65 @@ HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
-    // Live Feed Toggle
+    // Real-Time Push Stream Toggle (Server-Sent Events)
+    let liveEventSource = null;
     let liveTimer = null;
+
     function toggleLiveFeed() {
       const btn = document.getElementById('btnLiveToggle');
-      if (liveTimer) {
-        clearInterval(liveTimer);
-        liveTimer = null;
-        btn.textContent = '▶️ Start Live Stream';
+      if (liveEventSource || liveTimer) {
+        if (liveEventSource) {
+          liveEventSource.close();
+          liveEventSource = null;
+        }
+        if (liveTimer) {
+          clearInterval(liveTimer);
+          liveTimer = null;
+        }
+        btn.textContent = '▶️ Start Realtime Stream';
         btn.classList.remove('btn-primary');
         btn.classList.add('btn-live');
       } else {
-        btn.textContent = '⏹️ Stop Live Stream';
+        btn.textContent = '⏹️ Stop Realtime Stream';
         btn.classList.remove('btn-live');
         btn.classList.add('btn-primary');
-        liveTimer = setInterval(async () => {
-          try {
-            const res = await fetch('/api/live-tick');
-            const data = await res.json();
-            updateDashboardData(data);
-          } catch (e) {
-            console.error('Live tick error:', e);
-          }
-        }, 1500);
+
+        if (window.EventSource) {
+          liveEventSource = new EventSource('/api/v1/stream');
+          liveEventSource.onmessage = (event) => {
+            try {
+              fetch('/api/telemetry')
+                .then(r => r.json())
+                .then(updateDashboardData);
+            } catch (err) {
+              console.error('SSE parse error:', err);
+            }
+          };
+          liveEventSource.onerror = () => {
+            console.warn('SSE closed or unsupported, falling back to polling.');
+            if (liveEventSource) {
+              liveEventSource.close();
+              liveEventSource = null;
+            }
+            if (!liveTimer) {
+              liveTimer = setInterval(async () => {
+                try {
+                  const res = await fetch('/api/live-tick');
+                  const data = await res.json();
+                  updateDashboardData(data);
+                } catch (e) {}
+              }, 1200);
+            }
+          };
+        } else {
+          liveTimer = setInterval(async () => {
+            try {
+              const res = await fetch('/api/live-tick');
+              const data = await res.json();
+              updateDashboardData(data);
+            } catch (e) {}
+          }, 1200);
+        }
       }
     }
 
@@ -818,13 +855,34 @@ def wsgi_app(environ: Dict[str, Any], start_response: Any) -> List[bytes]:
 
 
 class MetricsHandler(BaseHTTPRequestHandler):
-    """HTTP Request Handler serving Web Dashboard, REST APIs, and Prometheus metrics."""
+    """HTTP Request Handler serving Web Dashboard, SSE streams, Ingestion APIs, and Prometheus metrics."""
 
     def do_GET(self) -> None:
         raw_path = self.path or "/"
         parts = raw_path.split("?", 1)
         path = parts[0]
         query = parts[1] if len(parts) > 1 else ""
+
+        # Real-time Server-Sent Events (SSE) telemetry stream
+        if path in ("/api/v1/stream", "/api/stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            server = get_shared_server()
+            try:
+                while server._running:
+                    payload = server.advance_live_tick()
+                    latest = payload["records"][-1] if payload.get("records") else {}
+                    msg = f"data: {json.dumps(latest)}\n\n".encode("utf-8")
+                    self.wfile.write(msg)
+                    self.wfile.flush()
+                    time.sleep(1.0)
+            except (BrokenPipeError, ConnectionResetError, Exception):
+                pass
+            return
 
         environ = {
             "PATH_INFO": path,
@@ -849,13 +907,50 @@ class MetricsHandler(BaseHTTPRequestHandler):
         for chunk in body_parts:
             self.wfile.write(chunk)
 
+    def do_POST(self) -> None:
+        """Handles real-time workload ingestion and execution requests."""
+        raw_path = self.path or "/"
+        parts = raw_path.split("?", 1)
+        path = parts[0]
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+
+        server = get_shared_server()
+        if path in ("/api/v1/workload/ingest", "/api/ingest", "/api/v1/tasks/submit"):
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                rate = float(payload.get("request_rate_rps", 50.0))
+                count = int(payload.get("request_count", 1))
+                priority = int(payload.get("priority", 1))
+                res = server.ingest_real_workload(rate, count, priority)
+                resp_bytes = json.dumps(res).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(resp_bytes)))
+                self.end_headers()
+                self.wfile.write(resp_bytes)
+                return
+            except Exception as e:
+                err = json.dumps({"error": str(e)}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(err)))
+                self.end_headers()
+                self.wfile.write(err)
+                return
+
+        self.send_response(404)
+        self.end_headers()
+
     def log_message(self, format: str, *args: Any) -> None:
         """Suppress standard access logs to keep terminal readable."""
         pass
 
 
 class WorkloadMetricsServer:
-    """Manages the lifecycle of the metrics and dashboard HTTP server."""
+    """Manages the lifecycle of the metrics, real-time ingestion, and dashboard HTTP server."""
 
     def __init__(
         self,
@@ -869,7 +964,7 @@ class WorkloadMetricsServer:
         self.host = host or exporter_cfg.get("host", "0.0.0.0")
         self.port = int(port or exporter_cfg.get("port", 8000))
         self.manager = PrometheusMetricsManager()
-        self.server: Optional[HTTPServer] = None
+        self.server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
 
@@ -954,17 +1049,52 @@ class WorkloadMetricsServer:
         self.cached_records = telemetry_df.to_dict(orient="records")
         return {"pattern": pattern, "records": self.cached_records}
 
+    def ingest_real_workload(
+        self,
+        incoming_rate: float = 50.0,
+        request_count: int = 1,
+        priority: int = 1,
+    ) -> Dict[str, Any]:
+        """Ingests live real-time workloads and executes them through the resource engine."""
+        if not self.live_engine:
+            self.live_engine = SimulationEngine(config=self.config, random_seed=int(time.time()))
+
+        self.live_time += 1.0
+        for _ in range(request_count):
+            self.live_engine.request_seq += 1
+            req_id = f"real-task-{self.live_engine.request_seq}"
+            req = QueuedRequest.create(
+                request_id=req_id,
+                arrival_time=self.live_time,
+                priority=priority,
+                timeout_sec=self.live_engine.queue.request_timeout_sec,
+            )
+            self.live_engine.queue.enqueue(req, self.live_time)
+
+        record = self.live_engine.step(self.live_time, float(incoming_rate))
+        self.manager.update_from_record(record)
+
+        flat = records_to_dataframe([record]).to_dict(orient="records")[0]
+        self.cached_records.append(flat)
+        if len(self.cached_records) > 120:
+            self.cached_records.pop(0)
+
+        return {
+            "status": "success",
+            "active_tasks_queued": self.live_engine.queue.depth,
+            "record": flat,
+        }
+
     def advance_live_tick(self) -> Dict[str, Any]:
-        """Advances live streaming simulation by 1 second."""
+        """Advances live streaming workload monitoring by 1 second."""
         if not self.live_engine or not self.live_generator:
             self.live_engine = SimulationEngine(config=self.config, random_seed=int(time.time()))
             self.live_generator = WorkloadGenerator(config=self.config, random_seed=int(time.time()))
 
         self.live_time += 1.0
-        timeline = np.array([self.live_time])
         pat = self.config.get("traffic_generator", {}).get("active_pattern", "composite")
-        rates = self.live_generator.generate_composite(timeline)
-        rate = float(rates[0]) if len(rates) > 0 else 50.0
+        rates_df = self.live_generator.generate(pattern_type=pat)
+        rate = float(rates_df["request_rate_rps"].iloc[0]) if len(rates_df) > 0 else 50.0
 
         record = self.live_engine.step(self.live_time, rate)
         self.manager.update_from_record(record)
@@ -980,13 +1110,14 @@ class WorkloadMetricsServer:
         return {"records": self.cached_records}
 
     def start(self, background: bool = False) -> None:
-        """Starts the dashboard and metrics server."""
+        """Starts the multi-threaded dashboard and metrics server."""
         MetricsHandler.server_instance = self
-        self.server = HTTPServer((self.host, self.port), MetricsHandler)
+        self.server = ThreadingHTTPServer((self.host, self.port), MetricsHandler)
         self._running = True
 
         display_host = "localhost" if self.host in ("0.0.0.0", "") else self.host
-        print(f"\n[+] Interactive Web Dashboard: http://{display_host}:{self.port}/")
+        print(f"\n[+] Real-Time Web Dashboard: http://{display_host}:{self.port}/")
+        print(f"[+] Real-Time SSE Stream: http://{display_host}:{self.port}/api/v1/stream")
         print(f"[+] Prometheus Metrics Endpoint: http://{display_host}:{self.port}/metrics\n")
 
         if background:
@@ -1000,10 +1131,10 @@ class WorkloadMetricsServer:
 
     def stop(self) -> None:
         if self.server:
+            self._running = False
             self.server.shutdown()
             self.server.server_close()
-            self._running = False
-            print("[Exporter] Server stopped.")
+            print("[Exporter] Real-Time Server stopped.")
 
 
 if __name__ == "__main__":
@@ -1012,7 +1143,6 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000, help="Bind port")
     args = parser.parse_args()
 
-    # Import numpy for live tick generator if needed
     import numpy as np
 
     server = WorkloadMetricsServer(host=args.host, port=args.port)

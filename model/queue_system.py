@@ -14,6 +14,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from interface.schema import DropReasonEnum
 
 
+import threading
+
+
 @dataclass(order=True)
 class QueuedRequest:
     """Represents an in-flight or waiting transaction in the simulation."""
@@ -62,31 +65,35 @@ class RequestQueue:
 
         self._items: List[QueuedRequest] = []
         self._counter: int = 0
+        self._lock = threading.RLock()
 
     @property
     def depth(self) -> int:
-        return len(self._items)
+        with self._lock:
+            return len(self._items)
 
     @property
     def is_full(self) -> bool:
-        return len(self._items) >= self.max_capacity
+        with self._lock:
+            return len(self._items) >= self.max_capacity
 
     def purge_expired(self, current_time: float) -> List[Tuple[QueuedRequest, DropReasonEnum]]:
         """Purges requests that have exceeded their timeout deadline."""
-        surviving: List[QueuedRequest] = []
-        expired: List[Tuple[QueuedRequest, DropReasonEnum]] = []
+        with self._lock:
+            surviving: List[QueuedRequest] = []
+            expired: List[Tuple[QueuedRequest, DropReasonEnum]] = []
 
-        for req in self._items:
-            if (current_time - req.arrival_time) > req.timeout_sec:
-                expired.append((req, DropReasonEnum.TIMEOUT))
-            else:
-                surviving.append(req)
+            for req in self._items:
+                if (current_time - req.arrival_time) > req.timeout_sec:
+                    expired.append((req, DropReasonEnum.TIMEOUT))
+                else:
+                    surviving.append(req)
 
-        self._items = surviving
-        if self.queue_type == "PRIORITY":
-            heapq.heapify(self._items)
+            self._items = surviving
+            if self.queue_type == "PRIORITY":
+                heapq.heapify(self._items)
 
-        return expired
+            return expired
 
     def enqueue(
         self,
@@ -98,47 +105,52 @@ class RequestQueue:
         Returns:
             Tuple of (accepted: bool, dropped_request: Optional[QueuedRequest], reason: DropReasonEnum)
         """
-        # Purge stale requests first
-        self.purge_expired(current_time)
+        with self._lock:
+            # Purge stale requests first
+            self.purge_expired(current_time)
 
-        if len(self._items) < self.max_capacity:
-            if self.queue_type == "PRIORITY":
-                heapq.heappush(self._items, request)
-            else:
-                self._items.append(request)
-            return True, None, DropReasonEnum.NONE
+            if len(self._items) < self.max_capacity:
+                if self.queue_type == "PRIORITY":
+                    heapq.heappush(self._items, request)
+                else:
+                    self._items.append(request)
+                return True, None, DropReasonEnum.NONE
 
-        # Queue is saturated - execute drop policy
-        if self.drop_policy == "DROP_TAIL" or self.drop_policy == "REJECT":
-            reason = DropReasonEnum.REJECTED if self.drop_policy == "REJECT" else DropReasonEnum.QUEUE_OVERFLOW
-            return False, request, reason
+            # Queue is saturated - execute drop policy
+            if self.drop_policy == "DROP_TAIL" or self.drop_policy == "REJECT":
+                reason = DropReasonEnum.REJECTED if self.drop_policy == "REJECT" else DropReasonEnum.QUEUE_OVERFLOW
+                return False, request, reason
 
-        elif self.drop_policy == "DROP_HEAD":
-            # Evict the oldest/highest priority item at head to make room
-            if self.queue_type == "PRIORITY":
-                evicted = heapq.heappop(self._items)
-                heapq.heappush(self._items, request)
-            else:
-                evicted = self._items.pop(0)
-                self._items.append(request)
-            return True, evicted, DropReasonEnum.QUEUE_OVERFLOW
+            elif self.drop_policy == "DROP_HEAD":
+                # For priority queue, drop the LOWEST priority (highest sort_index) to protect high-pri
+                if self.queue_type == "PRIORITY":
+                    lowest_pri_idx = max(range(len(self._items)), key=lambda i: self._items[i].sort_index)
+                    evicted = self._items.pop(lowest_pri_idx)
+                    heapq.heapify(self._items)
+                    heapq.heappush(self._items, request)
+                else:
+                    evicted = self._items.pop(0)
+                    self._items.append(request)
+                return True, evicted, DropReasonEnum.QUEUE_OVERFLOW
 
-        # Default fallback: reject
-        return False, request, DropReasonEnum.QUEUE_OVERFLOW
+            # Default fallback: reject
+            return False, request, DropReasonEnum.QUEUE_OVERFLOW
 
     def dequeue(self, current_time: float) -> Optional[QueuedRequest]:
         """Pulls the next eligible non-expired request from the queue."""
-        while self._items:
-            if self.queue_type == "PRIORITY":
-                candidate = heapq.heappop(self._items)
-            else:
-                candidate = self._items.pop(0)
+        with self._lock:
+            while self._items:
+                if self.queue_type == "PRIORITY":
+                    candidate = heapq.heappop(self._items)
+                else:
+                    candidate = self._items.pop(0)
 
-            # Check if candidate timed out while waiting in queue
-            if (current_time - candidate.arrival_time) <= candidate.timeout_sec:
-                return candidate
+                # Check if candidate timed out while waiting in queue
+                if (current_time - candidate.arrival_time) <= candidate.timeout_sec:
+                    return candidate
 
-        return None
+            return None
 
     def clear(self) -> None:
-        self._items.clear()
+        with self._lock:
+            self._items.clear()

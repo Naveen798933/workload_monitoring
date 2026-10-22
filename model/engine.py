@@ -131,7 +131,7 @@ class SimulationEngine:
         served_count = 0
 
         # Calculate current load factor across ready workers
-        active_ratio = self.worker_pool.compute_cpu_utilization()
+        active_ratio = self.worker_pool.compute_cpu_utilization(incoming_rate_rps)
 
         while served_count < max_processable_in_step and self.queue.depth > 0:
             req = self.queue.dequeue(current_time)
@@ -146,47 +146,53 @@ class SimulationEngine:
             served_latencies_ms.append(total_latency_ms)
             served_count += 1
 
-        # 6. Update worker in-flight load counters based on served vs capacity
+        # 6. Update worker in-flight load counters with exact remainder distribution
+        served_rate = served_count / self.time_step_sec
         if ready_workers:
-            per_worker_concurrency = int(
-                round((served_count / max(1, len(ready_workers))) * (self.base_service_time_ms / 1000.0))
+            base_count = served_count // len(ready_workers)
+            remainder = served_count % len(ready_workers)
+            per_worker_concurrency = max(
+                1 if served_count > 0 else 0,
+                int(round((served_count / len(ready_workers)) * (self.base_service_time_ms / 1000.0 * 15.0)))
             )
-            for w in ready_workers:
+            for idx, w in enumerate(ready_workers):
+                extra = 1 if idx < remainder else 0
+                w.total_served += (base_count + extra)
                 w.active_requests = min(w.max_concurrency, per_worker_concurrency)
-                w.total_served += served_count // len(ready_workers)
 
-        # 7. Compute latency distribution percentiles
+        # 7. Compute latency distribution percentiles with monotonic boundary safety
         if served_latencies_ms:
             sorted_lat = sorted(served_latencies_ms)
-            p_min = float(sorted_lat[0])
-            p_mean = float(np.mean(sorted_lat))
-            p_50 = float(np.percentile(sorted_lat, 50))
-            p_90 = float(np.percentile(sorted_lat, 90))
-            p_95 = float(np.percentile(sorted_lat, 95))
-            p_99 = float(np.percentile(sorted_lat, 99))
-            p_max = float(sorted_lat[-1])
+            raw_min = float(sorted_lat[0])
+            raw_mean = float(np.mean(sorted_lat))
+            raw_50 = float(np.percentile(sorted_lat, 50))
+            raw_90 = float(np.percentile(sorted_lat, 90))
+            raw_95 = float(np.percentile(sorted_lat, 95))
+            raw_99 = float(np.percentile(sorted_lat, 99))
+            raw_max = float(sorted_lat[-1])
         else:
-            # Baseline when no requests served
-            p_min = self.base_service_time_ms
-            p_mean = self.base_service_time_ms
-            p_50 = self.base_service_time_ms
-            p_90 = self.base_service_time_ms
-            p_95 = self.base_service_time_ms
-            p_99 = self.base_service_time_ms
-            p_max = self.base_service_time_ms
+            raw_min = raw_mean = raw_50 = raw_90 = raw_95 = raw_99 = raw_max = self.base_service_time_ms
+
+        p_min = round(raw_min, 2)
+        p_50 = max(p_min, round(raw_50, 2))
+        p_90 = max(p_50, round(raw_90, 2))
+        p_95 = max(p_90, round(raw_95, 2))
+        p_99 = max(p_95, round(raw_99, 2))
+        p_max = max(p_99, round(raw_max, 2))
+        p_mean = round(raw_mean, 2)
 
         latency_record = LatencyDistributionRecord(
-            min_ms=round(p_min, 2),
-            mean_ms=round(p_mean, 2),
-            p50_ms=round(p_50, 2),
-            p90_ms=round(p_90, 2),
-            p95_ms=round(p_95, 2),
-            p99_ms=round(p_99, 2),
-            max_ms=round(p_max, 2),
+            min_ms=p_min,
+            mean_ms=p_mean,
+            p50_ms=p_50,
+            p90_ms=p_90,
+            p95_ms=p_95,
+            p99_ms=p_99,
+            max_ms=p_max,
         )
 
-        # 8. Compute resources
-        cpu_util = self.worker_pool.compute_cpu_utilization()
+        # 8. Compute resources based on actual served rate
+        cpu_util = self.worker_pool.compute_cpu_utilization(current_throughput_rps=served_rate)
         mem_used, mem_total, mem_ratio = self.worker_pool.compute_memory_metrics()
         total_cores = sum(w.cpu_cores for w in self.worker_pool.workers)
 

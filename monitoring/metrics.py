@@ -95,7 +95,24 @@ class PrometheusMetricsManager:
             registry=self.registry,
         )
 
-        # Latency Histograms
+        # Latency Quantile Gauges (Accurate Prometheus standard representation)
+        self.latency_p50_seconds = Gauge(
+            "workload_latency_p50_seconds",
+            "Observed 50th percentile (median) request latency in seconds",
+            registry=self.registry,
+        )
+        self.latency_p95_seconds = Gauge(
+            "workload_latency_p95_seconds",
+            "Observed 95th percentile request latency in seconds",
+            registry=self.registry,
+        )
+        self.latency_p99_seconds = Gauge(
+            "workload_latency_p99_seconds",
+            "Observed 99th percentile request latency in seconds",
+            registry=self.registry,
+        )
+
+        # Raw Observation Histograms
         self.request_duration_seconds = Histogram(
             "workload_request_duration_seconds",
             "End-to-end request service latency including queuing time",
@@ -109,6 +126,12 @@ class PrometheusMetricsManager:
             buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0),
             registry=self.registry,
         )
+
+    def observe_real_request(self, latency_seconds: float, queue_wait_seconds: float = 0.0) -> None:
+        """Observes an actual completed transaction into Prometheus histograms."""
+        self.request_duration_seconds.observe(latency_seconds)
+        if queue_wait_seconds > 0.0:
+            self.queue_wait_seconds.observe(queue_wait_seconds)
 
     def update_from_record(self, record: TelemetryRecord, endpoint: str = "/api/v1/workload") -> None:
         """Dynamically ingests a TelemetryRecord and updates all registered Prometheus collectors."""
@@ -139,15 +162,17 @@ class PrometheusMetricsManager:
         self.memory_used_bytes.set(record.resources.memory_used_mb * 1024 * 1024)
         self.memory_total_bytes.set(record.resources.memory_total_mb * 1024 * 1024)
 
-        # 3. Update histograms (observe median and tail values)
-        p50_sec = record.latency.p50_ms / 1000.0
-        p95_sec = record.latency.p95_ms / 1000.0
-        p99_sec = record.latency.p99_ms / 1000.0
-        self.request_duration_seconds.observe(p50_sec)
-        self.request_duration_seconds.observe(p95_sec)
-        self.request_duration_seconds.observe(p99_sec)
+        # 3. Update dedicated quantile gauges
+        self.latency_p50_seconds.set(record.latency.p50_ms / 1000.0)
+        self.latency_p95_seconds.set(record.latency.p95_ms / 1000.0)
+        self.latency_p99_seconds.set(record.latency.p99_ms / 1000.0)
 
-        self.queue_wait_seconds.observe(record.queue.queue_wait_p95_sec)
+        # 4. Observe representative step distribution safely into histogram
+        if record.served_rate_rps > 0:
+            self.request_duration_seconds.observe(record.latency.mean_ms / 1000.0)
+
+        if record.queue.queue_wait_p95_sec > 0:
+            self.queue_wait_seconds.observe(record.queue.queue_wait_p95_sec)
 
     def scrape_latest(self) -> bytes:
         """Generates Prometheus text-format scrape response."""
