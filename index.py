@@ -23,5 +23,10 @@ application = wsgi_app
 handler = MetricsHandler
 
 if __name__ == "__main__":
+    port_env = os.environ.get("PORT")
+    port = int(port_env) if port_env else 8000
+    host_env = os.environ.get("HOST", "0.0.0.0")
     server = get_shared_server()
+    server.host = host_env
+    server.port = port
     server.start(background=False)

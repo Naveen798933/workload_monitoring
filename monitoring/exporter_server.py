@@ -1068,8 +1068,8 @@ class WorkloadMetricsServer:
         self.config = config or load_config()
         exporter_cfg = self.config.get("monitoring", {}).get("exporter", {})
 
-        self.host = host or exporter_cfg.get("host", "0.0.0.0")
-        self.port = int(port or exporter_cfg.get("port", 8000))
+        self.host = host or os.environ.get("HOST") or exporter_cfg.get("host", "0.0.0.0")
+        self.port = int(port or os.environ.get("PORT") or exporter_cfg.get("port", 8000))
         self.manager = PrometheusMetricsManager()
         self.server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None

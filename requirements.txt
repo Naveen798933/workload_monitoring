@@ -6,3 +6,4 @@ pydantic>=2.6.0
 pyyaml>=6.0.1
 pyarrow>=15.0.0
 requests>=2.31.0
+gunicorn>=21.2.0

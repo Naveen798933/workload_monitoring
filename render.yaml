@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: workload-monitoring
+    runtime: python
+    region: oregon
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python index.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.4
+      - key: MPLCONFIGDIR
+        value: /tmp/matplotlib
